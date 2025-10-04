@@ -95,8 +95,8 @@ p.add_argument('--log_interval', type=int, default=100)
 
 # front-end choices
 p.add_argument('--front_end', type=str, default='none',
-               choices=['none', 'lpsconv', 'spectral'],
-               help="Prefilter: 'lpsconv' (your linear-phase), 'spectral' (FFT truncation, non-causal), or 'none'.")
+    choices=['none', 'lpsconv', 'lpsconv_plus', 'spectral'],
+    help="Prefilter: 'lpsconv' (old), 'lpsconv_plus' (new), 'spectral' (FFT), or 'none'.")
 
 # your method (lpsconv) options
 p.add_argument('--sym_kernel', type=int, default=21, help='odd kernel length for symmetric FIR')
@@ -138,12 +138,16 @@ core = TCNClassifier(in_channels=in_channels, num_classes=num_classes,
                      kernel_size=args.ksize, dropout=args.dropout)
 
 if args.front_end == 'lpsconv':
+    from TCN.common.hartley_tcn import HartleyTCN
     model = HartleyTCN(base_tcn=core, in_channels=in_channels,
-                       use_front=True, k=args.sym_kernel, h=args.sym_h,
-                       causal=args.sym_causal, residual=(not args.sym_no_residual))
+                       use_front=True, k=args.sym_kernel, h=1.0,
+                       causal=False, residual=True)
+elif args.front_end == 'lpsconv_plus':
+    front = build_front_end(kind='lpsconv_plus', in_channels=in_channels, k=21)
+    model = nn.Sequential(front, core)
 elif args.front_end == 'spectral':
     front = build_front_end(kind='spectral', in_channels=in_channels, cutoff_ratio=args.spec_cut)
-    model = nn.Sequential(front, core)  # SpectralPool1d -> TCNClassifier
+    model = nn.Sequential(front, core)
 else:
     model = core
 
