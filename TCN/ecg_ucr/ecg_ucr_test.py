@@ -31,37 +31,44 @@ except Exception:
 from TCN.common.hartley_tcn import HartleyTCN             # your linear-phase front-end wrapper
 from TCN.common.front_end_factory import build_front_end   # supports 'spectral' and 'none'
 
-# ---- data loader: ECG200 via sktime (downloads automatically) ----
-def load_ecg200_numpy3d(seed=123):
+# ---- data loader: generic UCR via sktime (downloads automatically) ----
+def load_ucr_numpy3d(name: str, seed=123):
     """
-    Returns standardized float32 arrays:
-      X_train (N,C,T), y_train (N,)
-      X_val, y_val
-      X_test, y_test
+    Returns standardized float32 arrays for any UCR dataset:
+      X_train (N,C,T), y_train (N,), X_val, y_val, X_test, y_test
     """
     from sktime.datasets import load_UCR_UEA_dataset  # auto-downloads
-    X_tr, y_tr = load_UCR_UEA_dataset(name="ECG200", split="train",
+    X_tr, y_tr = load_UCR_UEA_dataset(name=name, split="train",
                                       return_X_y=True, return_type="numpy3D")
-    X_te, y_te = load_UCR_UEA_dataset(name="ECG200", split="test",
+    X_te, y_te = load_UCR_UEA_dataset(name=name, split="test",
                                       return_X_y=True, return_type="numpy3D")
+
     # Label-encode to 0..C-1
     classes, y_tr_enc = np.unique(y_tr, return_inverse=True)
     y_te_enc = np.searchsorted(classes, y_te)
 
-    # train/val split (20% of train)
-    rng = np.random.RandomState(seed)
-    n = X_tr.shape[0]
-    idx = rng.permutation(n)
-    nv = max(1, int(0.2 * n))
-    val_idx, train_idx = idx[:nv], idx[nv:]
-    X_train, y_train = X_tr[train_idx], y_tr_enc[train_idx]
-    X_val,   y_val   = X_tr[val_idx],   y_tr_enc[val_idx]
-    X_test,  y_test  = X_te,            y_te_enc
+    # Stratified 80/20 train/val split
+    try:
+        from sklearn.model_selection import StratifiedShuffleSplit
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
+        (tr_idx, va_idx), = sss.split(X_tr, y_tr_enc)
+    except Exception:
+        # fallback: random split if sklearn absent
+        rng = np.random.RandomState(seed)
+        n = X_tr.shape[0]
+        idx = rng.permutation(n)
+        nv = max(1, int(0.2 * n))
+        va_idx, tr_idx = idx[:nv], idx[nv:]
+
+    X_train, y_train = X_tr[tr_idx], y_tr_enc[tr_idx]
+    X_val,   y_val   = X_tr[va_idx], y_tr_enc[va_idx]
+    X_test,  y_test  = X_te,         y_te_enc
 
     # z-score using TRAIN stats (per-channel)
     mu = X_train.mean(axis=(0, 2), keepdims=True)
     sd = X_train.std(axis=(0, 2), keepdims=True) + 1e-8
     def norm(a): return ((a - mu) / sd).astype(np.float32)
+
     return norm(X_train), y_train.astype(np.int64), \
            norm(X_val),   y_val.astype(np.int64),   \
            norm(X_test),  y_test.astype(np.int64)
@@ -72,17 +79,19 @@ class NumpyTSDataset(torch.utils.data.Dataset):
     def __getitem__(self, i): return self.X[i], self.y[i]
 
 # ---------------- argparse ----------------
-p = argparse.ArgumentParser("UCR ECG200 — TCN classification")
+p = argparse.ArgumentParser("UCR — TCN classification (bigger dataset ready)")
+p.add_argument('--ucr_name', type=str, default='FordA',
+               help="UCR dataset name (e.g., FordA, ElectricDevices, Beef, ...)")
 p.add_argument('--batch_size', type=int, default=64)
-p.add_argument('--epochs', type=int, default=20)
+p.add_argument('--epochs', type=int, default=50)
 p.add_argument('--seed', type=int, default=123)
 p.add_argument('--cuda', action='store_false', help='use CUDA (default: True)')
 p.add_argument('--lr', type=float, default=1e-3)
-p.add_argument('--levels', type=int, default=4)
-p.add_argument('--hidden', type=int, default=64)
+p.add_argument('--levels', type=int, default=5)
+p.add_argument('--hidden', type=int, default=128)
 p.add_argument('--ksize', type=int, default=3)
 p.add_argument('--dropout', type=float, default=0.1)
-p.add_argument('--log_interval', type=int, default=50)
+p.add_argument('--log_interval', type=int, default=100)
 
 # front-end choices
 p.add_argument('--front_end', type=str, default='none',
@@ -90,9 +99,9 @@ p.add_argument('--front_end', type=str, default='none',
                help="Prefilter: 'lpsconv' (your linear-phase), 'spectral' (FFT truncation, non-causal), or 'none'.")
 
 # your method (lpsconv) options
-p.add_argument('--sym_kernel', type=int, default=11, help='odd kernel length for symmetric FIR')
+p.add_argument('--sym_kernel', type=int, default=21, help='odd kernel length for symmetric FIR')
 p.add_argument('--sym_h', type=float, default=1.0)
-p.add_argument('--sym_causal', action='store_true', help='causal front-end (optional; ECG is offline so typically False)')
+p.add_argument('--sym_causal', action='store_true', help='set if you need causal prefiltering')
 p.add_argument('--sym_no_residual', action='store_true', help='use front output only (no residual add)')
 
 # spectral pooling option
@@ -106,26 +115,34 @@ torch.manual_seed(args.seed)
 device = torch.device('cuda' if torch.cuda.is_available() and args.cuda else 'cpu')
 
 # ---------------- data ----------------
-X_tr, y_tr, X_va, y_va, X_te, y_te = load_ecg200_numpy3d(seed=args.seed)
+X_tr, y_tr, X_va, y_va, X_te, y_te = load_ucr_numpy3d(name=args.ucr_name, seed=args.seed)
+in_channels = X_tr.shape[1]
+num_classes = int(max(y_tr.max(), y_va.max(), y_te.max()) + 1)
+T = X_tr.shape[2]
+
 train_loader = torch.utils.data.DataLoader(NumpyTSDataset(X_tr, y_tr),
                                            batch_size=args.batch_size, shuffle=True)
 val_loader   = torch.utils.data.DataLoader(NumpyTSDataset(X_va, y_va),
                                            batch_size=args.batch_size, shuffle=False)
 test_loader  = torch.utils.data.DataLoader(NumpyTSDataset(X_te, y_te),
                                            batch_size=args.batch_size, shuffle=False)
-num_classes = int(max(y_tr.max(), y_va.max(), y_te.max()) + 1)
+
+steps_per_epoch = math.ceil(len(train_loader.dataset) / args.batch_size)
+print(f"[UCR:{args.ucr_name}] train={len(train_loader.dataset)}  val={len(val_loader.dataset)}  "
+      f"test={len(test_loader.dataset)}  | C={in_channels} T={T} classes={num_classes}  "
+      f"| steps/epoch={steps_per_epoch}")
 
 # ---------------- model ----------------
-core = TCNClassifier(in_channels=1, num_classes=num_classes,
+core = TCNClassifier(in_channels=in_channels, num_classes=num_classes,
                      levels=args.levels, hidden=args.hidden,
                      kernel_size=args.ksize, dropout=args.dropout)
 
 if args.front_end == 'lpsconv':
-    model = HartleyTCN(base_tcn=core, in_channels=1,
+    model = HartleyTCN(base_tcn=core, in_channels=in_channels,
                        use_front=True, k=args.sym_kernel, h=args.sym_h,
                        causal=args.sym_causal, residual=(not args.sym_no_residual))
 elif args.front_end == 'spectral':
-    front = build_front_end(kind='spectral', in_channels=1, cutoff_ratio=args.spec_cut)
+    front = build_front_end(kind='spectral', in_channels=in_channels, cutoff_ratio=args.spec_cut)
     model = nn.Sequential(front, core)  # SpectralPool1d -> TCNClassifier
 else:
     model = core
@@ -140,7 +157,7 @@ def run_epoch(loader, train=True):
     total_loss, total_correct, total = 0.0, 0, 0
     t0 = time.time()
     for bi, (x, y) in enumerate(loader, 1):
-        x, y = x.to(device), y.to(device)   # x: (B,1,T)
+        x, y = x.to(device), y.to(device)   # x: (B,C,T)
         if train: opt.zero_grad()
         logits = model(x)
         loss = criterion(logits, y)
@@ -152,7 +169,7 @@ def run_epoch(loader, train=True):
         total += x.size(0)
         if train and bi % args.log_interval == 0:
             ms = (time.time() - t0) * 1000.0 / args.log_interval
-            print(f'| batch {bi:4d} | ms/batch {ms:6.2f} | loss {loss.item():.4f}')
+            print(f'| batch {bi:5d} | ms/batch {ms:7.2f} | loss {loss.item():.4f}')
             t0 = time.time()
     return total_loss / total, total_correct / total
 
