@@ -29,7 +29,7 @@ except Exception:
             return self.fc(h)            # (B,C)
 
 from TCN.common.hartley_tcn import HartleyTCN             # your linear-phase front-end wrapper
-from TCN.common.front_end_factory import build_front_end   # supports 'spectral' and 'none'
+from TCN.common.front_end_factory import build_front_end   # now supports multiple FEs
 
 # ---- data loader: generic UCR via sktime (downloads automatically) ----
 def load_ucr_numpy3d(name: str, seed=123):
@@ -93,19 +93,25 @@ p.add_argument('--ksize', type=int, default=3)
 p.add_argument('--dropout', type=float, default=0.1)
 p.add_argument('--log_interval', type=int, default=100)
 
-# front-end choices
+# --- front-end choices ---
 p.add_argument('--front_end', type=str, default='none',
-    choices=['none', 'lpsconv', 'lpsconv_plus', 'spectral'],
-    help="Prefilter: 'lpsconv' (old), 'lpsconv_plus' (new), 'spectral' (FFT), or 'none'.")
+    choices=['none', 'lpsconv', 'lpsconv_plus', 'spectral', 'sincnet_bank', 'fir_remez', 'blurpool'],
+    help="Prefilter: 'lpsconv' (old), 'lpsconv_plus', 'spectral', 'sincnet_bank', 'fir_remez', 'blurpool', or 'none'.")
 
 # your method (lpsconv) options
 p.add_argument('--sym_kernel', type=int, default=21, help='odd kernel length for symmetric FIR')
 p.add_argument('--sym_h', type=float, default=1.0)
-p.add_argument('--sym_causal', action='store_true', help='set if you need causal prefiltering')
-p.add_argument('--sym_no_residual', action='store_true', help='use front output only (no residual add)')
+p.add_argument('--sym_causal', action='store_true')
+p.add_argument('--sym_no_residual', action='store_true')
 
 # spectral pooling option
 p.add_argument('--spec_cut', type=float, default=0.5, help='keep ratio in rFFT bins (0,1]')
+
+# new front-end knobs
+p.add_argument('--fe_k', type=int, default=63, help='generic kernel length for new FEs (odd)')
+p.add_argument('--fe_bands', type=int, default=8, help='bands for sincnet_bank')
+p.add_argument('--fe_cut', type=float, default=0.5, help='cutoff ratio for fir_remez (0..1)')
+p.add_argument('--fe_stride', type=int, default=1, help='stride for blurpool')
 
 args = p.parse_args()
 
@@ -141,13 +147,23 @@ if args.front_end == 'lpsconv':
     from TCN.common.hartley_tcn import HartleyTCN
     model = HartleyTCN(base_tcn=core, in_channels=in_channels,
                        use_front=True, k=args.sym_kernel, h=1.0,
-                       causal=False, residual=True)
-elif args.front_end == 'lpsconv_plus':
-    front = build_front_end(kind='lpsconv_plus', in_channels=in_channels, k=21)
+                       causal=args.sym_causal, residual=not args.sym_no_residual)
+
+elif args.front_end in ('lpsconv_plus', 'spectral', 'sincnet_bank', 'fir_remez', 'blurpool'):
+    from TCN.common.front_end_factory import build_front_end
+    if args.front_end == 'spectral':
+        front = build_front_end(kind='spectral', in_channels=in_channels, cutoff_ratio=args.spec_cut)
+    elif args.front_end == 'lpsconv_plus':
+        front = build_front_end(kind='lpsconv_plus', in_channels=in_channels, k=args.fe_k)
+    elif args.front_end == 'sincnet_bank':
+        front = build_front_end(kind='sincnet_bank', in_channels=in_channels, k=args.fe_k, bands=args.fe_bands)
+    elif args.front_end == 'fir_remez':
+        front = build_front_end(kind='fir_remez', in_channels=in_channels, k=args.fe_k, cutoff_ratio=args.fe_cut)
+    elif args.front_end == 'blurpool':
+        # use a small odd k (e.g., 5) for classic binomial BlurPool; stride controls downsample
+        front = build_front_end(kind='blurpool', in_channels=in_channels, k=5, stride=args.fe_stride)
     model = nn.Sequential(front, core)
-elif args.front_end == 'spectral':
-    front = build_front_end(kind='spectral', in_channels=in_channels, cutoff_ratio=args.spec_cut)
-    model = nn.Sequential(front, core)
+
 else:
     model = core
 
