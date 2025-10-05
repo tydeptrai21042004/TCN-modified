@@ -23,4 +23,10 @@ def build_front_end(kind: str,
         k_half = _odd(max(7, k // 2))   # e.g., k=21 -> k_half=11 (odd)
         return LPSConvPlus(in_ch=in_channels, k1=k_half, k2=k_half,
                            causal=False, unity_dc=True)
+    if kind == "lpsconv_sinc":
+        from .frontends.sinc_lpf1d import SincLPF1d
+        k = _odd(k)
+        return SincLPF1d(in_ch=in_channels, k=k, cutoff=0.25,
+                         learn_cutoff=True, learn_beta=True,
+                         causal=False, unity_dc=True)
     raise ValueError(f"Unknown front-end: {kind}")
