@@ -1,5 +1,5 @@
 # TCN/ecg_ucr/ecg_ucr_test.py
-import argparse, sys, time, math, warnings
+import argparse, sys, time, math, warnings, os
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -28,22 +28,23 @@ except Exception:
             h = self.gap(h).squeeze(-1)  # (B,H)
             return self.fc(h)            # (B,C)
 
-from TCN.common.hartley_tcn import HartleyTCN             # your linear-phase front-end wrapper
-from TCN.common.front_end_factory import build_front_end   # now supports multiple FEs
+# ---------------- dataset loaders ----------------
+def _zscore_train_stats(Xtr):
+    mu = Xtr.mean(axis=(0, 2), keepdims=True)
+    sd = Xtr.std(axis=(0, 2), keepdims=True) + 1e-8
+    return mu, sd
 
-# ---- data loader: generic UCR via sktime (downloads automatically) ----
+def _apply_zscore(X, mu, sd):
+    return ((X - mu) / sd).astype(np.float32)
+
 def load_ucr_numpy3d(name: str, seed=123):
-    """
-    Returns standardized float32 arrays for any UCR dataset:
-      X_train (N,C,T), y_train (N,), X_val, y_val, X_test, y_test
-    """
-    from sktime.datasets import load_UCR_UEA_dataset  # auto-downloads
+    """Any UCR/UEA dataset via sktime, unified to (N,C,T)."""
+    from sktime.datasets import load_UCR_UEA_dataset
     X_tr, y_tr = load_UCR_UEA_dataset(name=name, split="train",
                                       return_X_y=True, return_type="numpy3D")
     X_te, y_te = load_UCR_UEA_dataset(name=name, split="test",
                                       return_X_y=True, return_type="numpy3D")
 
-    # Label-encode to 0..C-1
     classes, y_tr_enc = np.unique(y_tr, return_inverse=True)
     y_te_enc = np.searchsorted(classes, y_te)
 
@@ -53,25 +54,111 @@ def load_ucr_numpy3d(name: str, seed=123):
         sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
         (tr_idx, va_idx), = sss.split(X_tr, y_tr_enc)
     except Exception:
-        # fallback: random split if sklearn absent
         rng = np.random.RandomState(seed)
-        n = X_tr.shape[0]
-        idx = rng.permutation(n)
-        nv = max(1, int(0.2 * n))
+        idx = rng.permutation(X_tr.shape[0]); nv = max(1, int(0.2 * X_tr.shape[0]))
         va_idx, tr_idx = idx[:nv], idx[nv:]
 
     X_train, y_train = X_tr[tr_idx], y_tr_enc[tr_idx]
     X_val,   y_val   = X_tr[va_idx], y_tr_enc[va_idx]
     X_test,  y_test  = X_te,         y_te_enc
 
-    # z-score using TRAIN stats (per-channel)
-    mu = X_train.mean(axis=(0, 2), keepdims=True)
-    sd = X_train.std(axis=(0, 2), keepdims=True) + 1e-8
-    def norm(a): return ((a - mu) / sd).astype(np.float32)
+    mu, sd = _zscore_train_stats(X_train)
+    return _apply_zscore(X_train, mu, sd), y_train.astype(np.int64), \
+           _apply_zscore(X_val,   mu, sd), y_val.astype(np.int64),   \
+           _apply_zscore(X_test,  mu, sd), y_test.astype(np.int64)
 
-    return norm(X_train), y_train.astype(np.int64), \
-           norm(X_val),   y_val.astype(np.int64),   \
-           norm(X_test),  y_test.astype(np.int64)
+def load_speechcommands(root: str, sample_rate=16000, seconds=1.0):
+    """Google SpeechCommands v2 via torchaudio; fixed-length mono waveforms -> (N,1,T)."""
+    import torchaudio
+    from torchaudio.datasets import SPEECHCOMMANDS
+
+    # official split files exist inside dataset; helper to map split name
+    class SubsetSC(SPEECHCOMMANDS):
+        def __init__(self, subset: str, **kw):
+            super().__init__(**kw)
+            def load_list(filename):
+                filepath = os.path.join(self._path, filename)
+                with open(filepath) as f: return [os.path.join(self._path, l.strip()) for l in f]
+            if subset == "validation":
+                self._walker = load_list("validation_list.txt")
+            elif subset == "testing":
+                self._walker = load_list("testing_list.txt")
+            elif subset == "training":
+                excludes = set(load_list("validation_list.txt") + load_list("testing_list.txt"))
+                self._walker = [w for w in self._walker if os.path.join(self._path, w) not in excludes]
+            else:
+                raise ValueError("subset must be 'training'/'validation'/'testing'")
+
+    target_len = int(sample_rate * seconds)
+    resample = torchaudio.transforms.Resample(orig_freq=16000, new_freq=sample_rate)
+
+    def _to_numpy(ds):
+        xs, ys, labels = [], [], sorted(list(set(i[2] for i in ds)))  # label strings
+        lab2id = {lab:i for i,lab in enumerate(labels)}
+        for wav, sr, label, *_ in ds:
+            if sr != sample_rate: wav = resample(wav)
+            wav = wav.mean(dim=0, keepdim=True)          # (1, T)
+            T = wav.shape[-1]
+            if T < target_len:
+                wav = torch.nn.functional.pad(wav, (0, target_len - T))
+            else:
+                wav = wav[..., :target_len]
+            xs.append(wav.numpy()); ys.append(lab2id[label])
+        X = np.stack(xs, axis=0).astype(np.float32)      # (N,1,T)
+        y = np.array(ys, dtype=np.int64)
+        return X, y, labels
+
+    train = SubsetSC(subset="training",  root=root, download=True)
+    valid = SubsetSC(subset="validation",root=root, download=True)
+    test  = SubsetSC(subset="testing",   root=root, download=True)
+
+    Xtr, ytr, labels = _to_numpy(train)
+    Xva, yva, _      = _to_numpy(valid)
+    Xte, yte, _      = _to_numpy(test)
+
+    # z-score using train stats
+    mu, sd = _zscore_train_stats(Xtr)
+    return _apply_zscore(Xtr, mu, sd), ytr, \
+           _apply_zscore(Xva, mu, sd), yva, \
+           _apply_zscore(Xte, mu, sd), yte, labels
+
+def load_gtzan(root: str, sample_rate=16000, seconds=5.0):
+    """GTZAN (10 genres) via torchaudio; fixed-length mono waveforms -> (N,1,T)."""
+    import torchaudio
+    from torchaudio.datasets import GTZAN
+    target_len = int(sample_rate * seconds)
+    resample = torchaudio.transforms.Resample(orig_freq=22050, new_freq=sample_rate)
+
+    def _to_numpy(ds):
+        xs, ys, labels = [], [], sorted(list(set(d[2] for d in ds)))
+        lab2id = {lab:i for i,lab in enumerate(labels)}
+        for waveform, sr, label in ds:
+            if sr != sample_rate: waveform = resample(waveform)
+            wav = waveform.mean(dim=0, keepdim=True)   # mono
+            T = wav.shape[-1]
+            if T < target_len:
+                wav = torch.nn.functional.pad(wav, (0, target_len - T))
+            else:
+                wav = wav[..., :target_len]
+            xs.append(wav.numpy()); ys.append(lab2id[label])
+        X = np.stack(xs, axis=0).astype(np.float32); y = np.array(ys, dtype=np.int64)
+        return X, y, labels
+
+    train = GTZAN(root=root, subset='train', download=True)
+    test  = GTZAN(root=root, subset='test',  download=True)
+    # no official val split; use 20% of train as val (stratified)
+    Xtr_all, ytr_all, labels = _to_numpy(train)
+    from sklearn.model_selection import StratifiedShuffleSplit
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=123)
+    (tr_idx, va_idx), = sss.split(Xtr_all, ytr_all)
+    Xtr, ytr = Xtr_all[tr_idx], ytr_all[tr_idx]
+    Xva, yva = Xtr_all[va_idx], ytr_all[va_idx]
+    Xte, yte, _ = _to_numpy(test)
+
+    mu, sd = _zscore_train_stats(Xtr)
+    return _apply_zscore(Xtr, mu, sd), ytr, \
+           _apply_zscore(Xva, mu, sd), yva, \
+           _apply_zscore(Xte, mu, sd), yte, labels
 
 class NumpyTSDataset(torch.utils.data.Dataset):
     def __init__(self, X, y): self.X = torch.from_numpy(X); self.y = torch.from_numpy(y)
@@ -79,9 +166,14 @@ class NumpyTSDataset(torch.utils.data.Dataset):
     def __getitem__(self, i): return self.X[i], self.y[i]
 
 # ---------------- argparse ----------------
-p = argparse.ArgumentParser("UCR — TCN classification (bigger dataset ready)")
+p = argparse.ArgumentParser("TCN classification across multiple time-series datasets")
+p.add_argument('--source', type=str, default='ucr',
+               choices=['ucr','uea','speechcommands','gtzan'],
+               help="dataset source family")
 p.add_argument('--ucr_name', type=str, default='FordA',
-               help="UCR dataset name (e.g., FordA, ElectricDevices, Beef, ...)")
+               help="UCR/UEA dataset name (ignored if source is speechcommands/gtzan)")
+p.add_argument('--data_root', type=str, default='./data',
+               help="root dir for torchaudio datasets (SC/GTZAN)")
 p.add_argument('--batch_size', type=int, default=64)
 p.add_argument('--epochs', type=int, default=50)
 p.add_argument('--seed', type=int, default=123)
@@ -95,8 +187,8 @@ p.add_argument('--log_interval', type=int, default=100)
 
 # --- front-end choices ---
 p.add_argument('--front_end', type=str, default='none',
-    choices=['none', 'lpsconv', 'lpsconv_plus', 'spectral', 'sincnet_bank', 'fir_remez', 'blurpool'],
-    help="Prefilter: 'lpsconv' (old), 'lpsconv_plus', 'spectral', 'sincnet_bank', 'fir_remez', 'blurpool', or 'none'.")
+    choices=['none', 'lpsconv', 'lpsconv_plus', 'spectral', 'sincnet_bank'],
+    help="Prefilter: 'lpsconv' (old), 'lpsconv_plus', 'spectral', 'sincnet_bank', or 'none'.")
 
 # your method (lpsconv) options
 p.add_argument('--sym_kernel', type=int, default=21, help='odd kernel length for symmetric FIR')
@@ -107,11 +199,9 @@ p.add_argument('--sym_no_residual', action='store_true')
 # spectral pooling option
 p.add_argument('--spec_cut', type=float, default=0.5, help='keep ratio in rFFT bins (0,1]')
 
-# new front-end knobs
+# front-end knobs
 p.add_argument('--fe_k', type=int, default=63, help='generic kernel length for new FEs (odd)')
 p.add_argument('--fe_bands', type=int, default=8, help='bands for sincnet_bank')
-p.add_argument('--fe_cut', type=float, default=0.5, help='cutoff ratio for fir_remez (0..1)')
-p.add_argument('--fe_stride', type=int, default=1, help='stride for blurpool')
 
 args = p.parse_args()
 
@@ -121,7 +211,18 @@ torch.manual_seed(args.seed)
 device = torch.device('cuda' if torch.cuda.is_available() and args.cuda else 'cpu')
 
 # ---------------- data ----------------
-X_tr, y_tr, X_va, y_va, X_te, y_te = load_ucr_numpy3d(name=args.ucr_name, seed=args.seed)
+if args.source in ('ucr','uea'):
+    X_tr, y_tr, X_va, y_va, X_te, y_te = load_ucr_numpy3d(name=args.ucr_name, seed=args.seed)
+    dataset_label = f"{args.source.upper()}:{args.ucr_name}"
+elif args.source == 'speechcommands':
+    X_tr, y_tr, X_va, y_va, X_te, y_te, labels = load_speechcommands(root=args.data_root, sample_rate=16000, seconds=1.0)
+    dataset_label = "SPEECHCOMMANDS"
+elif args.source == 'gtzan':
+    X_tr, y_tr, X_va, y_va, X_te, y_te, labels = load_gtzan(root=args.data_root, sample_rate=16000, seconds=5.0)
+    dataset_label = "GTZAN"
+else:
+    raise ValueError("unknown source")
+
 in_channels = X_tr.shape[1]
 num_classes = int(max(y_tr.max(), y_va.max(), y_te.max()) + 1)
 T = X_tr.shape[2]
@@ -134,7 +235,7 @@ test_loader  = torch.utils.data.DataLoader(NumpyTSDataset(X_te, y_te),
                                            batch_size=args.batch_size, shuffle=False)
 
 steps_per_epoch = math.ceil(len(train_loader.dataset) / args.batch_size)
-print(f"[UCR:{args.ucr_name}] train={len(train_loader.dataset)}  val={len(val_loader.dataset)}  "
+print(f"[{dataset_label}] train={len(train_loader.dataset)}  val={len(val_loader.dataset)}  "
       f"test={len(test_loader.dataset)}  | C={in_channels} T={T} classes={num_classes}  "
       f"| steps/epoch={steps_per_epoch}")
 
@@ -148,22 +249,18 @@ if args.front_end == 'lpsconv':
     model = HartleyTCN(base_tcn=core, in_channels=in_channels,
                        use_front=True, k=args.sym_kernel, h=1.0,
                        causal=args.sym_causal, residual=not args.sym_no_residual)
-
-elif args.front_end in ('lpsconv_plus', 'spectral', 'sincnet_bank', 'fir_remez', 'blurpool'):
+elif args.front_end == 'lpsconv_plus':
     from TCN.common.front_end_factory import build_front_end
-    if args.front_end == 'spectral':
-        front = build_front_end(kind='spectral', in_channels=in_channels, cutoff_ratio=args.spec_cut)
-    elif args.front_end == 'lpsconv_plus':
-        front = build_front_end(kind='lpsconv_plus', in_channels=in_channels, k=args.fe_k)
-    elif args.front_end == 'sincnet_bank':
-        front = build_front_end(kind='sincnet_bank', in_channels=in_channels, k=args.fe_k, bands=args.fe_bands)
-    elif args.front_end == 'fir_remez':
-        front = build_front_end(kind='fir_remez', in_channels=in_channels, k=args.fe_k, cutoff_ratio=args.fe_cut)
-    elif args.front_end == 'blurpool':
-        # use a small odd k (e.g., 5) for classic binomial BlurPool; stride controls downsample
-        front = build_front_end(kind='blurpool', in_channels=in_channels, k=5, stride=args.fe_stride)
+    front = build_front_end(kind='lpsconv_plus', in_channels=in_channels, k=args.fe_k)
     model = nn.Sequential(front, core)
-
+elif args.front_end == 'spectral':
+    from TCN.common.front_end_factory import build_front_end
+    front = build_front_end(kind='spectral', in_channels=in_channels, cutoff_ratio=args.spec_cut)
+    model = nn.Sequential(front, core)
+elif args.front_end == 'sincnet_bank':
+    from TCN.common.front_end_factory import build_front_end
+    front = build_front_end(kind='sincnet_bank', in_channels=in_channels, k=args.fe_k, bands=args.fe_bands)
+    model = nn.Sequential(front, core)
 else:
     model = core
 
