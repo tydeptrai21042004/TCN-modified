@@ -1,6 +1,8 @@
 # TCN/ecg_ucr/ecg_ucr_test.py
 import argparse, sys, time, math, warnings, os
 warnings.filterwarnings("ignore")
+from TCN.common.hartley_tcn import HartleyTCN             # your linear-phase front-end wrapper
+from TCN.common.front_end_factory import build_front_end   # now supports multiple FEs
 
 import numpy as np
 import torch
@@ -187,8 +189,8 @@ p.add_argument('--log_interval', type=int, default=100)
 
 # --- front-end choices ---
 p.add_argument('--front_end', type=str, default='none',
-    choices=['none', 'lpsconv', 'lpsconv_plus', 'spectral', 'sincnet_bank'],
-    help="Prefilter: 'lpsconv' (old), 'lpsconv_plus', 'spectral', 'sincnet_bank', or 'none'.")
+    choices=['none', 'lpsconv', 'lpsconv_plus', 'spectral', 'sincnet_bank', 'fir_remez', 'blurpool'],
+    help="Prefilter: 'lpsconv' (old), 'lpsconv_plus', 'spectral', 'sincnet_bank', 'fir_remez', 'blurpool', or 'none'.")
 
 # your method (lpsconv) options
 p.add_argument('--sym_kernel', type=int, default=21, help='odd kernel length for symmetric FIR')
