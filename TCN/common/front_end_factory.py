@@ -31,14 +31,14 @@ def build_front_end(kind: str,
         from .frontends.lpsconv_plus import LPSConvPlus
         k_half = _odd(max(7, k // 2))
         return LPSConvPlus(in_ch=in_channels, k1=k_half, k2=k_half,
-                           causal=False, unity_dc=True)
+                           causal=True, unity_dc=False)
 
     if kind == "lpsconv_sinc":
         from .frontends.sinc_lpf1d import SincLPF1d
         k = _odd(k)
         return SincLPF1d(in_ch=in_channels, k=k, cutoff=0.25,
                          learn_cutoff=True, learn_beta=True,
-                         causal=False, unity_dc=True)
+                         causal=True, unity_dc=False)
 
     if kind == "sincnet_bank":
         from .frontends.sincnet_bank import SincNetBank1d
