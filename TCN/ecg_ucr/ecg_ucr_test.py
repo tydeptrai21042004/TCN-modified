@@ -158,25 +158,306 @@ def build_speechcommands_datasets(root: str, sample_rate=16000, seconds=1.0):
 def build_gtzan_datasets(root: str, sample_rate=16000, seconds=5.0):
     import torchaudio
     from torchaudio.datasets import GTZAN
-
     target_len = int(sample_rate * seconds)
     resample = torchaudio.transforms.Resample(orig_freq=22050, new_freq=sample_rate) if sample_rate != 22050 else None
 
-    # torchaudio expects subset in {"training","validation","testing"}
-    train_base = GTZAN(root=root, subset='training',   download=True)
-    valid_base = GTZAN(root=root, subset='validation', download=True)
-    test_base  = GTZAN(root=root, subset='testing',    download=True)
+    def _make(base):
+        labels = _labels_from_walker_paths(base._walker)
+        tr = _FixedLenAudioDataset(base if getattr(base, 'subset', None) == 'training' else GTZAN(root=root, subset='training', download=False), labels, sample_rate, target_len, resample)
+        va = _FixedLenAudioDataset(base if getattr(base, 'subset', None) == 'validation' else GTZAN(root=root, subset='validation', download=False), labels, sample_rate, target_len, resample)
+        te = _FixedLenAudioDataset(base if getattr(base, 'subset', None) == 'testing' else GTZAN(root=root, subset='testing', download=False), labels, sample_rate, target_len, resample)
+        return tr, va, te, labels
 
-    labels = _labels_from_walker_paths(train_base._walker)
-    tr = _FixedLenAudioDataset(train_base, labels, sample_rate, target_len, resample)
-    va = _FixedLenAudioDataset(valid_base, labels, sample_rate, target_len, resample)
-    te = _FixedLenAudioDataset(test_base,  labels, sample_rate, target_len, resample)
+    # Try offline first
+    try:
+        base = GTZAN(root=root, subset='training', download=False)
+        return _make(base)
+    except Exception:
+        # Fallback to download; if it fails, raise a helpful error
+        try:
+            train_base = GTZAN(root=root, subset='training',   download=True)
+            valid_base = GTZAN(root=root, subset='validation', download=True)
+            test_base  = GTZAN(root=root, subset='testing',    download=True)
+            labels = _labels_from_walker_paths(train_base._walker)
+            tr = _FixedLenAudioDataset(train_base, labels, sample_rate, target_len, resample)
+            va = _FixedLenAudioDataset(valid_base, labels, sample_rate, target_len, resample)
+            te = _FixedLenAudioDataset(test_base,  labels, sample_rate, target_len, resample)
+            return tr, va, te, labels
+        except Exception as e:
+            raise RuntimeError(f"GTZAN not found under '{root}'. Network download failed ({e})."
+                               f"→ Manually place the dataset under '{root}' (folder 'gtzan' with cached files) or switch to a local dataset like 'esc50_local' or 'urban8k_local'.")
+
+class _SubsetView(Dataset):
+    def __init__(self, base, indices):
+        self.base = base
+        self.indices = list(indices)
+    def __len__(self):
+        return len(self.indices)
+    def __getitem__(self, i):
+        return self.base[self.indices[i]]
+
+def build_yesno_datasets(root: str, sample_rate=8000, seconds=1.0):
+    """YESNO (8-bit yes/no sequence) → map 8 bits to a categorical class.
+    Splits: 60%/20%/20% (stratified by pattern id)."""
+    import torchaudio
+    from torchaudio.datasets import YESNO
+    from sklearn.model_selection import StratifiedShuffleSplit
+
+    base = YESNO(root=root, download=True)
+
+    # Build labels (binary pattern 8 bits → int)
+    ids = list(range(len(base)))
+    lab_ids = []
+    for i in ids:
+        _, sr, bits = base[i]
+        lab_ids.append(int(''.join(str(int(b)) for b in bits), 2))
+
+    # Stratified 60/20/20
+    sss1 = StratifiedShuffleSplit(n_splits=1, test_size=0.4, random_state=123)
+    (train_idx, tmp_idx), = sss1.split(ids, lab_ids)
+    tmp_y = [lab_ids[i] for i in tmp_idx]
+    sss2 = StratifiedShuffleSplit(n_splits=1, test_size=0.5, random_state=123)
+    (val_rel, test_rel), = sss2.split(list(range(len(tmp_idx))), tmp_y)
+    val_idx  = [tmp_idx[i] for i in val_rel]
+    test_idx = [tmp_idx[i] for i in test_rel]
+
+    # Map used classes to contiguous ids
+    uniq = sorted(set(lab_ids))
+    lab2id = {lab:i for i,lab in enumerate(uniq)}
+
+    target_len = int(sample_rate * seconds)
+    resample = torchaudio.transforms.Resample(orig_freq=8000, new_freq=sample_rate) if sample_rate != 8000 else None
+
+    class YesNoFixed(Dataset):
+        def __init__(self, base, indices, lab2id, sample_rate, target_len, resampler):
+            self.base=base; self.indices=list(indices); self.lab2id=lab2id
+            self.sample_rate=sample_rate; self.target_len=int(target_len); self.resampler=resampler
+        def __len__(self): return len(self.indices)
+        def __getitem__(self, j):
+            i = self.indices[j]
+            waveform, sr, bits = self.base[i]
+            if sr != self.sample_rate and self.resampler is not None:
+                waveform = self.resampler(waveform)
+            wav = waveform.mean(dim=0, keepdim=True)
+            T = wav.shape[-1]
+            if T < self.target_len: wav = torch.nn.functional.pad(wav, (0, self.target_len - T))
+            else: wav = wav[..., :self.target_len]
+            m = wav.mean(dim=-1, keepdim=True); s = wav.std(dim=-1, keepdim=True).clamp_min(1e-8); wav = (wav-m)/s
+            lab = int(''.join(str(int(b)) for b in bits), 2)
+            y = torch.tensor(self.lab2id[lab], dtype=torch.long)
+            return wav, y
+
+    tr = YesNoFixed(base, train_idx, lab2id, sample_rate, target_len, resample)
+    va = YesNoFixed(base, val_idx,   lab2id, sample_rate, target_len, resample)
+    te = YesNoFixed(base, test_idx,  lab2id, sample_rate, target_len, resample)
+    labels = [str(u) for u in uniq]
     return tr, va, te, labels
+
+def build_vctk_sid_datasets(root: str, sample_rate=16000, seconds=2.0):
+    """VCTK speaker-ID classification (labels are speaker IDs like 'p225').
+    Splits: 80/10/10 stratified by speaker."""
+    import torchaudio
+    from torchaudio.datasets import VCTK
+    from sklearn.model_selection import StratifiedShuffleSplit
+
+    base = VCTK(root=root, download=True)
+
+    # Extract speaker ids from dataset items (field at index 2 in torchaudio>=0.11)
+    speakers = []
+    for i in range(len(base)):
+        item = base[i]
+        spk = item[2] if len(item) > 2 else str(item[-1])
+        speakers.append(str(spk))
+
+    uniq = sorted(set(speakers))
+    spk2id = {s:i for i,s in enumerate(uniq)}
+
+    ids = list(range(len(base)))
+    y = [spk2id[s] for s in speakers]
+
+    # 80/20 then 50/50 of the 20% → 10/10
+    sss1 = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=123)
+    (train_idx, tmp_idx), = sss1.split(ids, y)
+    tmp_y = [y[i] for i in tmp_idx]
+    sss2 = StratifiedShuffleSplit(n_splits=1, test_size=0.5, random_state=123)
+    (val_rel, test_rel), = sss2.split(list(range(len(tmp_idx))), tmp_y)
+    val_idx  = [tmp_idx[i] for i in val_rel]
+    test_idx = [tmp_idx[i] for i in test_rel]
+
+    # resample VCTK 48 kHz → desired
+    resample = torchaudio.transforms.Resample(orig_freq=48000, new_freq=sample_rate) if sample_rate != 48000 else None
+    target_len = int(sample_rate * seconds)
+
+    # Wrap each split with a subset view and our fixed-len adapter
+    tr = _FixedLenAudioDataset(_SubsetView(base, train_idx), uniq, sample_rate, target_len, resample)
+    va = _FixedLenAudioDataset(_SubsetView(base, val_idx),   uniq, sample_rate, target_len, resample)
+    te = _FixedLenAudioDataset(_SubsetView(base, test_idx),  uniq, sample_rate, target_len, resample)
+    return tr, va, te, uniq
+
+def _assert_exists(p, msg):
+    if not os.path.exists(p):
+        raise RuntimeError(msg + f" — missing: {p}")
+
+class AudioPathLabelDataset(Dataset):
+    def __init__(self, items, labels, sample_rate, seconds, orig_sr=None):
+        import torchaudio
+        self.items = items  # list of (path, label_name)
+        self.labels = labels
+        self.lab2id = {lab:i for i, lab in enumerate(labels)}
+        self.sr = int(sample_rate)
+        self.T = int(self.sr * seconds)
+        self.ta = torchaudio
+        self.resampler = None if (orig_sr is None or orig_sr == self.sr) else self.ta.transforms.Resample(orig_freq=orig_sr, new_freq=self.sr)
+    def __len__(self): return len(self.items)
+    def __getitem__(self, idx):
+        path, lab = self.items[idx]
+        wav, sr = self.ta.load(path)
+        if sr != self.sr and self.resampler is not None:
+            wav = self.resampler(wav)
+        wav = wav.mean(dim=0, keepdim=True)
+        T = wav.shape[-1]
+        if T < self.T:
+            wav = torch.nn.functional.pad(wav, (0, self.T - T))
+        else:
+            wav = wav[..., :self.T]
+        m = wav.mean(dim=-1, keepdim=True); s = wav.std(dim=-1, keepdim=True).clamp_min(1e-8)
+        wav = (wav - m) / s
+        y = torch.tensor(self.lab2id[lab], dtype=torch.long)
+        return wav, y
+
+def build_esc50_local_datasets(root: str, sample_rate=16000, seconds=5.0):
+    """ESC-50 local loader (no download). Expect structure:
+    root/ESC-50/meta/esc50.csv and root/ESC-50/audio/*.wav
+    Splits: folds 1-4 train, fold 5 test; 10% of train → val (stratified).
+    """
+    import csv
+    base_dir = os.path.join(root, 'ESC-50')
+    meta = os.path.join(base_dir, 'meta', 'esc50.csv')
+    audio_dir = os.path.join(base_dir, 'audio')
+    _assert_exists(meta, "ESC-50 meta CSV not found")
+    _assert_exists(audio_dir, "ESC-50 audio folder not found")
+
+    rows = []
+    with open(meta, 'r', newline='') as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append((int(r['fold']), r['category'], os.path.join(audio_dir, r['filename'])))
+    labels = sorted({r[1] for r in rows})
+    items_train = [(p, c) for fold, c, p in rows if fold in (1,2,3,4)]
+    items_test  = [(p, c) for fold, c, p in rows if fold == 5]
+
+    # Stratified 10% of train → val
+    from sklearn.model_selection import StratifiedShuffleSplit
+    y = [c for _, c in items_train]
+    idxs = list(range(len(items_train)))
+    (tr_idx, va_idx), = StratifiedShuffleSplit(n_splits=1, test_size=0.1, random_state=123).split(idxs, y)
+    tr_items = [items_train[i] for i in tr_idx]
+    va_items = [items_train[i] for i in va_idx]
+
+    tr = AudioPathLabelDataset(tr_items, labels, sample_rate, seconds, orig_sr=44100)
+    va = AudioPathLabelDataset(va_items, labels, sample_rate, seconds, orig_sr=44100)
+    te = AudioPathLabelDataset(items_test, labels, sample_rate, seconds, orig_sr=44100)
+    return tr, va, te, labels
+
+def build_urban8k_local_datasets(root: str, sample_rate=16000, seconds=4.0):
+    """UrbanSound8K local loader (no download). Expect structure:
+    root/UrbanSound8K/metadata/UrbanSound8K.csv
+    root/UrbanSound8K/audio/foldX/*.wav
+    Splits: folds 1-8 train, 9 val, 10 test.
+    """
+    import csv
+    base_dir = os.path.join(root, 'UrbanSound8K')
+    meta = os.path.join(base_dir, 'metadata', 'UrbanSound8K.csv')
+    audio_root = os.path.join(base_dir, 'audio')
+    _assert_exists(meta, "UrbanSound8K metadata CSV not found")
+    _assert_exists(audio_root, "UrbanSound8K audio folder not found")
+
+    items_train, items_val, items_test = [], [], []
+    labels_set = set()
+    with open(meta, 'r', newline='') as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            fold = int(r['fold'])
+            cls  = r['class']
+            fname= r['slice_file_name']
+            path = os.path.join(audio_root, f'fold{fold}', fname)
+            labels_set.add(cls)
+            dest = items_train if fold <= 8 else (items_val if fold == 9 else items_test)
+            dest.append((path, cls))
+    labels = sorted(labels_set)
+
+    tr = AudioPathLabelDataset(items_train, labels, sample_rate, seconds, orig_sr=44100)
+    va = AudioPathLabelDataset(items_val,   labels, sample_rate, seconds, orig_sr=44100)
+    te = AudioPathLabelDataset(items_test,  labels, sample_rate, seconds, orig_sr=44100)
+    return tr, va, te, labels
+
+def build_physionet2017_local_datasets(root: str, sample_rate=300, seconds=30.0):
+    """PhysioNet 2017 Challenge (AF detection) local loader.
+    Expect: root/training2017/*.wav and root/REFERENCE.csv
+    Split: 80/10/10 stratified.
+    """
+    import csv
+    base = root
+    if os.path.isdir(os.path.join(root, 'training2017')):
+        base = root
+    elif os.path.isdir(os.path.join(root, 'PhysioNet2017', 'training2017')):
+        base = os.path.join(root, 'PhysioNet2017')
+    train_dir = os.path.join(base, 'training2017')
+    ref_csv   = os.path.join(base, 'REFERENCE.csv')
+    _assert_exists(train_dir, "PhysioNet2017 training2017 folder not found")
+    _assert_exists(ref_csv,   "PhysioNet2017 REFERENCE.csv not found")
+
+    rows = []
+    with open(ref_csv, 'r', newline='') as f:
+        reader = csv.reader(f)
+        for rid, lab in reader:
+            wav = os.path.join(train_dir, rid + '.wav')
+            if os.path.exists(wav):
+                rows.append((wav, lab))
+    # label mapping
+    labels = sorted({lab for _, lab in rows})
+    from sklearn.model_selection import StratifiedShuffleSplit
+    y = [lab for _, lab in rows]
+    idxs = list(range(len(rows)))
+    (train_idx, tmp_idx), = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=123).split(idxs, y)
+    tmp_y = [y[i] for i in tmp_idx]
+    (val_rel, test_rel), = StratifiedShuffleSplit(n_splits=1, test_size=0.5, random_state=123).split(list(range(len(tmp_idx))), tmp_y)
+    val_idx  = [tmp_idx[i] for i in val_rel]
+    test_idx = [tmp_idx[i] for i in test_rel]
+
+    tr_items = [rows[i] for i in train_idx]
+    va_items = [rows[i] for i in val_idx]
+    te_items = [rows[i] for i in test_idx]
+
+    tr = AudioPathLabelDataset(tr_items, labels, sample_rate, seconds, orig_sr=300)
+    va = AudioPathLabelDataset(va_items, labels, sample_rate, seconds, orig_sr=300)
+    te = AudioPathLabelDataset(te_items, labels, sample_rate, seconds, orig_sr=300)
+    return tr, va, te, labels
+
+def build_synthetic_sines_datasets(n_train=2000, n_val=400, n_test=400, sample_rate=100, seconds=2.0, n_classes=5, seed=123):
+    rng = np.random.RandomState(seed)
+    T = int(sample_rate * seconds)
+    Xs, Ys = [], []
+    freqs = np.linspace(1.0, 12.0, n_classes)
+    def gen(n):
+        X, y = [], []
+        for i in range(n):
+            c = rng.randint(0, n_classes)
+            f = freqs[c] + rng.randn()*0.1
+            t = np.arange(T) / sample_rate
+            sig = np.sin(2*np.pi*f*t + rng.rand()*2*np.pi)
+            sig += 0.1 * rng.randn(T)
+            X.append(sig[None, :].astype(np.float32))
+            y.append(c)
+        return np.stack(X), np.array(y, dtype=np.int64)
+    Xtr, ytr = gen(n_train); Xva, yva = gen(n_val); Xte, yte = gen(n_test)
+    mu, sd = _zscore_train_stats(Xtr)
+    return _apply_zscore(Xtr, mu, sd), ytr, _apply_zscore(Xva, mu, sd), yva, _apply_zscore(Xte, mu, sd), yte
 
 # ---------------- argparse ----------------
 p = argparse.ArgumentParser("TCN classification across multiple time-series datasets")
 p.add_argument('--source', type=str, default='ucr',
-               choices=['ucr','uea','speechcommands','gtzan'],
+               choices=['ucr','uea','speechcommands','gtzan','yesno','vctk_sid','esc50_local','urban8k_local','physionet2017_local','synthetic_sines'],
                help="dataset source family")
 p.add_argument('--ucr_name', type=str, default='FordA',
                help="UCR/UEA dataset name (ignored if source is speechcommands/gtzan)")
@@ -241,6 +522,25 @@ else:
     elif args.source == 'gtzan':
         tr_ds, va_ds, te_ds, labels = build_gtzan_datasets(root=args.data_root, sample_rate=16000, seconds=5.0)
         dataset_label = "GTZAN"
+    elif args.source == 'yesno':
+        tr_ds, va_ds, te_ds, labels = build_yesno_datasets(root=args.data_root, sample_rate=8000, seconds=1.0)
+        dataset_label = "YESNO"
+    elif args.source == 'vctk_sid':
+        tr_ds, va_ds, te_ds, labels = build_vctk_sid_datasets(root=args.data_root, sample_rate=16000, seconds=2.0)
+        dataset_label = "VCTK-SID"
+    elif args.source == 'esc50_local':
+        tr_ds, va_ds, te_ds, labels = build_esc50_local_datasets(root=args.data_root, sample_rate=16000, seconds=5.0)
+        dataset_label = "ESC-50 (local)"
+    elif args.source == 'urban8k_local':
+        tr_ds, va_ds, te_ds, labels = build_urban8k_local_datasets(root=args.data_root, sample_rate=16000, seconds=4.0)
+        dataset_label = "UrbanSound8K (local)"
+    elif args.source == 'physionet2017_local':
+        tr_ds, va_ds, te_ds, labels = build_physionet2017_local_datasets(root=args.data_root, sample_rate=300, seconds=30.0)
+        dataset_label = "PhysioNet2017 (local)"
+    elif args.source == 'synthetic_sines':
+        X_tr, y_tr, X_va, y_va, X_te, y_te = build_synthetic_sines_datasets()
+        dataset_label = "Synthetic Sines"
+        use_numpy_pipeline = True
     else:
         raise ValueError("unknown source")
 
